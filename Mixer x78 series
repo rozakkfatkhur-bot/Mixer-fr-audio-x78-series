@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Fr Audio - Digital Mixer Pro</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        background-color: #0b0f19;
+        color: #f3f4f6;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        overflow-x: hidden; /* Mencegah scroll horisontal yang tidak perlu */
+      }
+      /* Style khusus untuk scrollbar agar terlihat modern */
+      ::-webkit-scrollbar { width: 6px; }
+      ::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+      ::-webkit-scrollbar-track { background: #111827; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+
+
+import { useRef, useState, useCallback, useEffect } from "react";
+
+export const EQ_FREQS = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 12000, 16000, 20000];
+export const EQ_BANDS = EQ_FREQS.length;
+
+export const COLORS = [
+  "#e74c3c", "#e67e22", "#f1c40f", "#2ecc71",
+  "#1abc9c", "#3498db", "#9b59b6", "#e91e63",
+  "#ff5722", "#00bcd4"
+];
+
+export interface ChannelState {
+  id: number; name: string; type: "file" | "youtube";
+  volume: number; pan: number;
+  muted: boolean; soloed: boolean;
+  gain: number;
+  eq: number[];
+  hpfEnabled: boolean; hpfFreq: number;
+  lpfEnabled: boolean; lpfFreq: number;
+  compEnabled: boolean; compThreshold: number; compRatio: number;
+  compAttack: number; compRelease: number; compMakeup: number;
+  gateEnabled: boolean; gateThreshold: number;
+  phaseInvert: boolean;
+  stereoWidth: number; 
+  reverbSend: number; delaySend: number;
+  color: string; youtubeUrl?: string; fileName?: string;
+  isPlaying: boolean;
+  peakL: number; peakR: number; peakHoldL: number; peakHoldR: number;
+  gainReduction: number;
+}
+
+export interface MasterState {
+  volume: number;
+  peakL: number; peakR: number; peakHoldL: number; peakHoldR: number;
+  limiterActive: boolean; crossfade: number;
+  rmsL: number; rmsR: number;
+}
+
+type ChannelNodes = {
+  source: AudioBufferSourceNode | null;
+  gainNode: GainNode; muteGain: GainNode; phaseGain: GainNode;
+  panNode: StereoPannerNode;
+  hpf: BiquadFilterNode; lpf: BiquadFilterNode;
+  eqNodes: BiquadFilterNode[];
+  gateComp: DynamicsCompressorNode; gateBypass: GainNode; gateWet: GainNode;
+  compressor: DynamicsCompressorNode; compBypass: GainNode; compWet: GainNode;
+  analyserL: AnalyserNode; analyserR: AnalyserNode;
+  splitter: ChannelSplitterNode;
+  reverbSend: GainNode; delaySend: GainNode;
+  audioBuffer?: AudioBuffer; startTime?: number; offset?: number;
+  liveSourceNode?: AudioNode | null;
+};
+
+function makeDefaultChannel(id: number, name: string, type: "file" | "youtube", pan = 0): ChannelState {
+  return {
+    id, name, type, volume: 0.8, pan, muted: false, soloed: false, gain: 0,
+    eq: new Array(EQ_BANDS).fill(0),
+    hpfEnabled: false, hpfFreq: 80, lpfEnabled: false, lpfFreq: 18000,
+    compEnabled: false, compThreshold: -18, compRatio: 4, compAttack: 0.01, compRelease: 0.1, compMakeup: 0,
+    gateEnabled: false, gateThreshold: -50,
+    phaseInvert: false, stereoWidth: 1,
+    reverbSend: 0, delaySend: 0, color: COLORS[(id - 1) % COLORS.length], youtubeUrl: "", fileName: undefined,
+    isPlaying: false, peakL: 0, peakR: 0, peakHoldL: 0, peakHoldR: 0, gainReduction: 0,
+  };
+}
+
+const DEFAULT_CHANNELS: ChannelState[] = [
+  makeDefaultChannel(1, "CH 1", "file"),
+  makeDefaultChannel(2, "CH 2", "file"),
+  makeDefaultChannel(3, "CH 3", "file", -0.3),
+  makeDefaultChannel(4, "CH 4", "file", 0.3),
+  makeDefaultChannel(5, "CH 5", "file", -0.2),
+  makeDefaultChannel(6, "CH 6", "file", 0.2),
+  makeDefaultChannel(7, "YT 1", "youtube"),
+  makeDefaultChannel(8, "YT 2", "youtube"),
+  makeDefaultChannel(9, "FX A", "file", -0.4),
+  makeDefaultChannel(10, "FX B", "file", 0.4),
+];
+
+export function useAudioEngine() {
+  const ctxRef = useRef<AudioContext | null>(null);
+  const masterGainRef = useRef<GainNode | null>(null);
+  const masterAnalyserLRef = useRef<AnalyserNode | null>(null);
+  const masterAnalyserRRef = useRef<AnalyserNode | null>(null);
+  const reverbRef = useRef<ConvolverNode | null>(null);
+  const reverbReturnRef = useRef<GainNode | null>(null);
+  const delayRef = useRef<DelayNode | null>(null);
+  const delayReturnRef = useRef<GainNode | null>(null);
+  const channelNodesRef = useRef<Map<number, ChannelNodes>>(new Map());
+  const animRef = useRef<number | null>(null);
+
+  const [isReady, setIsReady] = useState(false);
+  const [channels, setChannels] = useState<ChannelState[]>(DEFAULT_CHANNELS);
+  const [master, setMaster] = useState<MasterState>({
+    volume: 0.85, peakL: 0, peakR: 0, peakHoldL: 0, peakHoldR: 0,
+    limiterActive: false, crossfade: 0.5, rmsL: 0, rmsR: 0,
+  });
+  const [reverbMix, setReverbMix] = useState(0.28);
+  const [delayMix, setDelayMix] = useState(0.22);
+  const [delayTime, setDelayTime] = useState(0.375);
+
+  const initAudio = useCallback(async () => {
+    if (ctxRef.current) return ctxRef.current;
+    const ctx = new AudioContext({ sampleRate: 44100 });
+    ctxRef.current = ctx;
+
+    const masterGain = ctx.createGain(); masterGain.gain.value = 0.85;
+    masterGainRef.current = masterGain;
+
+    const mSplit = ctx.createChannelSplitter(2);
+    const mAnalL = ctx.createAnalyser(); mAnalL.fftSize = 2048; mAnalL.smoothingTimeConstant = 0.75;
+    const mAnalR = ctx.createAnalyser(); mAnalR.fftSize = 2048; mAnalR.smoothingTimeConstant = 0.75;
+    masterAnalyserLRef.current = mAnalL;
+    masterAnalyserRRef.current = mAnalR;
+    masterGain.connect(mSplit);
+    mSplit.connect(mAnalL, 0); mSplit.connect(mAnalR, 1);
+    masterGain.connect(ctx.destination);
+
+    const reverb = ctx.createConvolver(); reverbRef.current = reverb;
+    const rLen = ctx.sampleRate * 2.8;
+    const rBuf = ctx.createBuffer(2, rLen, ctx.sampleRate);
+    for (let c = 0; c < 2; c++) {
+      const d = rBuf.getChannelData(c);
+      for (let i = 0; i < rLen; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / rLen, 2.2);
+    }
+    reverb.buffer = rBuf;
+    const reverbReturn = ctx.createGain(); reverbReturn.gain.value = reverbMix;
+    reverbReturnRef.current = reverbReturn;
+    reverb.connect(reverbReturn); reverbReturn.connect(masterGain);
+
+    const delay = ctx.createDelay(2.0); delay.delayTime.value = delayTime;
+    delayRef.current = delay;
+    const fb = ctx.createGain(); fb.gain.value = 0.38;
+    delay.connect(fb); fb.connect(delay);
+    const delayReturn = ctx.createGain(); delayReturn.gain.value = delayMix;
+    delayReturnRef.current = delayReturn;
+    delay.connect(delayReturn); delayReturn.connect(masterGain);
+
+    setIsReady(true);
+    return ctx;
+  }, [reverbMix, delayMix, delayTime]);
+
+  const createChannelNodes = useCallback((ctx: AudioContext, ch: ChannelState): ChannelNodes => {
+    const gainNode = ctx.createGain(); gainNode.gain.value = ch.volume;
+    const muteGain = ctx.createGain(); muteGain.gain.value = ch.muted ? 0 : 1;
+    const phaseGain = ctx.createGain(); phaseGain.gain.value = ch.phaseInvert ? -1 : 1;
+    const panNode = ctx.createStereoPanner(); panNode.pan.value = ch.pan;
+
+    const hpf = ctx.createBiquadFilter(); hpf.type = "highpass";
+    hpf.frequency.value = ch.hpfEnabled ? ch.hpfFreq : 20; hpf.Q.value = 0.707;
+    const lpf = ctx.createBiquadFilter(); lpf.type = "lowpass";
+    lpf.frequency.value = ch.lpfEnabled ? ch.lpfFreq : 20000; lpf.Q.value = 0.707;
+
+    const eqNodes: BiquadFilterNode[] = EQ_FREQS.map((freq, i) => {
+      const f = ctx.createBiquadFilter();
+      if (i === 0) f.type = "lowshelf";
+      else if (i === EQ_BANDS - 1) f.type = "highshelf";
+      else { f.type = "peaking"; f.Q.value = 1.4; }
+      f.frequency.value = freq; f.gain.value = ch.eq[i] ?? 0;
+      return f;
+    });
+
+    const gateComp = ctx.createDynamicsCompressor();
+    gateComp.threshold.value = ch.gateThreshold; gateComp.ratio.value = 20;
+    gateComp.attack.value = 0.001; gateComp.release.value = 0.05; gateComp.knee.value = 0;
+    const gateBypass = ctx.createGain(); gateBypass.gain.value = ch.gateEnabled ? 0 : 1;
+    const gateWet = ctx.createGain(); gateWet.gain.value = ch.gateEnabled ? 1 : 0;
+
+    const compressor = ctx.createDynamicsCompressor();
+    compressor.threshold.value = ch.compThreshold; compressor.ratio.value = ch.compRatio;
+    compressor.attack.value = ch.compAttack; compressor.release.value = ch.compRelease; compressor.knee.value = 6;
+    const compBypass = ctx.createGain(); compBypass.gain.value = ch.compEnabled ? 0 : 1;
+    const compWet = ctx.createGain(); compWet.gain.value = ch.compEnabled ? 1 : 0;
+
+    const splitter = ctx.createChannelSplitter(2);
+    const analyserL = ctx.createAnalyser(); analyserL.fftSize = 256;
+    const analyserR = ctx.createAnalyser(); analyserR.fftSize = 256;
+    const reverbSend = ctx.createGain(); reverbSend.gain.value = ch.reverbSend;
+    const delaySend = ctx.createGain(); delaySend.gain.value = ch.delaySend;
+
+    gainNode.connect(phaseGain);
+    phaseGain.connect(muteGain);
+    muteGain.connect(hpf); hpf.connect(lpf);
+    let prev: AudioNode = lpf;
+    for (const eq of eqNodes) { prev.connect(eq); prev = eq; }
+
+    const gateMix = ctx.createGain();
+    prev.connect(gateBypass); prev.connect(gateComp);
+    gateComp.connect(gateWet);
+    gateBypass.connect(gateMix); gateWet.connect(gateMix);
+
+    const compMix = ctx.createGain();
+    gateMix.connect(compBypass); gateMix.connect(compressor);
+    compressor.connect(compWet);
+    compBypass.connect(compMix); compWet.connect(compMix);
+
+    compMix.connect(panNode);
+    panNode.connect(splitter);
+    splitter.connect(analyserL, 0); splitter.connect(analyserR, 1);
+    panNode.connect(masterGainRef.current!);
+
+    prev.connect(reverbSend); reverbSend.connect(reverbRef.current!);
+    prev.connect(delaySend); delaySend.connect(delayRef.current!);
+
+    return { source: null, gainNode, muteGain, phaseGain, panNode, hpf, lpf, eqNodes, gateComp, gateBypass, gateWet, compressor, compBypass, compWet, analyserL, analyserR, splitter, reverbSend, delaySend, liveSourceNode: null };
+  }, []);
+
+  useEffect(() => {
+    const ctx = ctxRef.current; if (!ctx) return;
+    const anySoloed = channels.some(c => c.soloed);
+    const t = ctx.currentTime;
+    channels.forEach(ch => {
+      const nodes = channelNodesRef.current.get(ch.id); if (!nodes) return;
+      const dbGain = Math.pow(10, ch.gain / 20);
+      nodes.gainNode.gain.setTargetAtTime(ch.volume * dbGain, t, 0.01);
+      const muted = ch.muted || (anySoloed && !ch.soloed);
+      nodes.muteGain.gain.setTargetAtTime(muted ? 0 : 1, t, 0.01);
+      nodes.phaseGain.gain.setTargetAtTime(ch.phaseInvert ? -1 : 1, t, 0.005);
+      nodes.panNode.pan.setTargetAtTime(ch.pan, t, 0.01);
+      nodes.hpf.frequency.setTargetAtTime(ch.hpfEnabled ? ch.hpfFreq : 20, t, 0.01);
+      nodes.lpf.frequency.setTargetAtTime(ch.lpfEnabled ? ch.lpfFreq : 20000, t, 0.01);
+      nodes.eqNodes.forEach((eq, i) => eq.gain.setTargetAtTime(ch.eq[i] ?? 0, t, 0.01));
+      nodes.gateComp.threshold.setTargetAtTime(ch.gateThreshold, t, 0.01);
+      nodes.gateBypass.gain.setTargetAtTime(ch.gateEnabled ? 0 : 1, t, 0.01);
+      nodes.gateWet.gain.setTargetAtTime(ch.gateEnabled ? 1 : 0, t, 0.01);
+      nodes.compressor.threshold.setTargetAtTime(ch.compThreshold, t, 0.01);
+      nodes.compressor.ratio.setTargetAtTime(ch.compRatio, t, 0.01);
+      nodes.compressor.attack.setTargetAtTime(ch.compAttack, t, 0.01);
+      nodes.compressor.release.setTargetAtTime(ch.compRelease, t, 0.01);
+      nodes.compBypass.gain.setTargetAtTime(ch.compEnabled ? 0 : 1, t, 0.01);
+      nodes.compWet.gain.setTargetAtTime(ch.compEnabled ? 1 : 0, t, 0.01);
+      nodes.reverbSend.gain.setTargetAtTime(ch.reverbSend, t, 0.01);
+      nodes.delaySend.gain.setTargetAtTime(ch.delaySend, t, 0.01);
+    });
+  }, [channels]);
+
+  useEffect(() => {
+    if (masterGainRef.current && ctxRef.current)
+      masterGainRef.current.gain.setTargetAtTime(master.volume, ctxRef.current.currentTime, 0.01);
+  }, [master.volume]);
+
+  useEffect(() => {
+    const getPeak = (a: AnalyserNode) => {
+      const buf = new Float32Array(a.fftSize); a.getFloatTimeDomainData(buf);
+      let p = 0; for (let i = 0; i < buf.length; i++) { const v = Math.abs(buf[i]); if (v > p) p = v; }
+      return p;
+    };
+    const getRMS = (a: AnalyserNode) => {
+      const buf = new Float32Array(a.fftSize); a.getFloatTimeDomainData(buf);
+      let sum = 0; for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      return Math.sqrt(sum / buf.length);
+    };
+    const DECAY = 0.91, HDECAY = 0.997;
+    const tick = () => {
+      animRef.current = requestAnimationFrame(tick);
+      if (masterAnalyserLRef.current && masterAnalyserRRef.current) {
+        const pL = getPeak(masterAnalyserLRef.current), pR = getPeak(masterAnalyserRRef.current);
+        const rL = getRMS(masterAnalyserLRef.current), rR = getRMS(masterAnalyserRRef.current);
+        setMaster(prev => ({
+          ...prev,
+          peakL: Math.max(pL, prev.peakL * DECAY), peakR: Math.max(pR, prev.peakR * DECAY),
+          peakHoldL: Math.max(pL, prev.peakHoldL * HDECAY), peakHoldR: Math.max(pR, prev.peakHoldR * HDECAY),
+          limiterActive: pL > 0.95 || pR > 0.95,
+          rmsL: Math.max(rL, prev.rmsL * DECAY), rmsR: Math.max(rR, prev.rmsR * DECAY),
+        }));
+      }
+      setChannels(prev => prev.map(ch => {
+        const nodes = channelNodesRef.current.get(ch.id); if (!nodes) return ch;
+        const pL = getPeak(nodes.analyserL), pR = getPeak(nodes.analyserR);
+        const gr = Math.abs(nodes.compressor.reduction ?? 0);
+        return {
+          ...ch,
+          peakL: Math.max(pL, ch.peakL * DECAY), peakR: Math.max(pR, ch.peakR * DECAY),
+          peakHoldL: Math.max(pL, ch.peakHoldL * HDECAY), peakHoldR: Math.max(pR, ch.peakHoldR * HDECAY),
+          gainReduction: Math.max(gr / 40, ch.gainReduction * 0.93),
+        };
+      }));
+    };
+    animRef.current = requestAnimationFrame(tick);
+    return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
+  }, []);
+
+  const loadFile = useCallback(async (channelId: number, file: File) => {
+    const ctx = await initAudio();
+    if (ctx.state === "suspended") await ctx.resume();
+    setChannels(prev => prev.map(c => c.id === channelId ? { ...c, fileName: file.name, isPlaying: false } : c));
+    const buf = await file.arrayBuffer();
+    const audioBuffer = await ctx.decodeAudioData(buf);
+    const ch = channels.find(c => c.id === channelId); if (!ch) return;
+    if (!channelNodesRef.current.has(channelId)) channelNodesRef.current.set(channelId, createChannelNodes(ctx, ch));
+    const nodes = channelNodesRef.current.get(channelId)!;
+    if (nodes.source) { try { nodes.source.stop(); } catch {} }
+    nodes.audioBuffer = audioBuffer; nodes.source = null;
+  }, [initAudio, channels, createChannelNodes]);
+
+  const playChannel = useCallback(async (channelId: number) => {
+    const ctx = await initAudio();
+    if (ctx.state === "suspended") await ctx.resume();
+    const ch = channels.find(c => c.id === channelId); if (!ch) return;
+    if (!channelNodesRef.current.has(channelId)) channelNodesRef.current.set(channelId, createChannelNodes(ctx, ch));
+    const nodes = channelNodesRef.current.get(channelId)!;
+    if (!nodes.audioBuffer) return;
+    if (nodes.source) { try { nodes.source.stop(); } catch {} }
+    const src = ctx.createBufferSource();
+    src.buffer = nodes.audioBuffer; src.loop = true;
+    src.connect(nodes.gainNode); src.start(0);
+    nodes.source = src;
+    src.onended = () => setChannels(prev => prev.map(c => c.id === channelId ? { ...c, isPlaying: false } : c));
+    setChannels(prev => prev.map(c => c.id === channelId ? { ...c, isPlaying: true } : c));
+  }, [initAudio, channels, createChannelNodes]);
+
+  const stopChannel = useCallback((channelId: number) => {
+    const nodes = channelNodesRef.current.get(channelId); if (!nodes?.source) return;
+    try { nodes.source.stop(); } catch {}
+    nodes.source = null;
+    setChannels(prev => prev.map(c => c.id === channelId ? { ...c, isPlaying: false } : c));
+  }, []);
+
+  const updateChannel = useCallback((id: number, updates: Partial<ChannelState>) => {
+    setChannels(prev => prev.map(c => c.id === id ? { ...c, ...updates } : c));
+  }, []);
+
+  const updateMaster = useCallback((updates: Partial<MasterState>) => {
+    setMaster(prev => ({ ...prev, ...updates }));
+  }, []);
+
+  const connectLiveSource = useCallback(async (channelId: number, sourceNode: AudioNode) => {
+    const ctx = await initAudio();
+    if (ctx.state === "suspended") await ctx.resume();
+    const ch = channels.find(c => c.id === channelId); if (!ch) return;
+    if (!channelNodesRef.current.has(channelId)) channelNodesRef.current.set(channelId, createChannelNodes(ctx, ch));
+    const nodes = channelNodesRef.current.get(channelId)!;
+    if (nodes.source) { try { nodes.source.stop(); } catch {} nodes.source = null; }
+    if (nodes.liveSourceNode) { try { nodes.liveSourceNode.disconnect(nodes.gainNode); } catch {} }
+    try {
+      sourceNode.connect(nodes.gainNode);
+      nodes.liveSourceNode = sourceNode;
+    } catch (err) { console.error(err); }
+    setChannels(prev => prev.map(c => c.id === channelId ? { ...c, isPlaying: true } : c));
+  }, [initAudio, channels, createChannelNodes]);
+
+  const disconnectLiveSource = useCallback((channelId: number) => {
+    const nodes = channelNodesRef.current.get(channelId);
+    if (nodes && nodes.liveSourceNode) {
+      try { nodes.liveSourceNode.disconnect(nodes.gainNode); } catch {}
+      nodes.liveSourceNode = null;
+    }
+    setChannels(prev => prev.map(c => c.id === channelId ? { ...c, isPlaying: false } : c));
+  }, []);
+
+  const getContext = useCallback(() => ctxRef.current, []);
+
+  return {
+    channels, master, isReady, reverbMix, delayMix, delayTime,
+    setReverbMix, setDelayMix, setDelayTime, loadFile, playChannel, stopChannel,
+    updateChannel, updateMaster, connectLiveSource, disconnectLiveSource, getContext,
+  };
+}
+import { useRef, useState, useCallback } from "react";
+
+export interface AudioDevice {
+  deviceId: string;
+  label: string;
+  kind: MediaDeviceKind;
+}
+
+export interface LiveInput {
+  channelId: number;
+  deviceId: string;
+  inputChannel: number;
+  stream: MediaStream | null;
+  sourceNode: MediaStreamAudioSourceNode | null;
+  splitter: ChannelSplitterNode | null;
+  channelCount: number;
+  active: boolean;
+}
+
+export function useLiveInputs(
+  audioCtx: AudioContext | null,
+  connectSource: (channelId: number, node: AudioNode) => void,
+  disconnectSource: (channelId: number) => void,
+) {
+  const [devices, setDevices] = useState<AudioDevice[]>([]);
+  const [liveInputs, setLiveInputs] = useState<Map<number, LiveInput>>(new Map());
+  const [devicePermission, setDevicePermission] = useState<"idle" | "pending" | "granted" | "denied">("idle");
+  const streamsRef = useRef<Map<string, MediaStream>>(new Map());
+
+  const refreshDevices = useCallback(async () => {
+    try {
+      if (devicePermission !== "granted") {
+        setDevicePermission("pending");
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+        setDevicePermission("granted");
+      }
+      const all = await navigator.mediaDevices.enumerateDevices();
+      const inputs = all
+        .filter(d => d.kind === "audioinput")
+        .map(d => ({ deviceId: d.deviceId, label: d.label || `Input Device`, kind: d.kind }));
+      setDevices(inputs);
+    } catch (err) {
+      setDevicePermission("denied");
+    }
+  }, [devicePermission]);
+
+  const getOrCreateStream = useCallback(async (deviceId: string) => {
+    const constraints = {
+      audio: {
+        deviceId: deviceId === "default" ? undefined : { exact: deviceId },
+        channelCount: { ideal: 8, min: 1 },
+        echoCancellation: false, autoGainControl: false, noiseSuppression: false,
+      }
+    };
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    const count = stream.getAudioTracks()[0].getSettings().channelCount ?? 1;
+    streamsRef.current.set(deviceId, stream);
+    return { stream, channelCount: count };
+  }, []);
+
+  const activateLive = useCallback(async (channelId: number, deviceId: string, inputChannel: number) => {
+    if (!audioCtx) return;
+    try {
+      const { stream, channelCount } = await getOrCreateStream(deviceId);
+      const sourceNode = audioCtx.createMediaStreamSource(stream);
+      const splitter = audioCtx.createChannelSplitter(Math.max(channelCount, 1));
+      const mono = audioCtx.createGain();
+      sourceNode.connect(splitter);
+      splitter.connect(mono, Math.min(inputChannel, channelCount - 1), 0);
+      connectSource(channelId, mono);
+      
+      setLiveInputs(prev => {
+        const next = new Map(prev);
+        const old = prev.get(channelId);
+        if (old?.sourceNode) { try { old.sourceNode.disconnect(); old.splitter?.disconnect(); } catch {} }
+        next.set(channelId, { channelId, deviceId, inputChannel, stream, sourceNode, splitter, channelCount, active: true });
+        return next;
+      });
+    } catch (err) { console.warn(err); }
+  }, [audioCtx, getOrCreateStream, connectSource]);
+
+  const deactivateLive = useCallback((channelId: number) => {
+    setLiveInputs(prev => {
+      const input = prev.get(channelId); if (!input) return prev;
+      try { input.sourceNode?.disconnect(); input.splitter?.disconnect(); } catch {}
+      disconnectSource(channelId);
+      const next = new Map(prev);
+      next.set(channelId, { ...input, active: false, sourceNode: null, splitter: null, stream: null });
+      return next;
+    });
+  }, [disconnectSource]);
+
+  return { devices, liveInputs, devicePermission, refreshDevices, activateLive, deactivateLive };
+}
+import { useState, useCallback } from "react";
+import type { AudioDevice, LiveInput } from "../hooks/useLiveInputs";
+import type { ChannelState } from "../hooks/useAudioEngine";
+
+interface LiveInputPanelProps {
+  devices: AudioDevice[];
+  liveInputs: Map<number, LiveInput>;
+  devicePermission: "idle" | "pending" | "granted" | "denied";
+  channels: ChannelState[];
+  onRefreshDevices: () => void;
+  onActivate: (channelId: number, deviceId: string, inputChannel: number) => void;
+  onDeactivate: (channelId: number) => void;
+}
+
+export function LiveInputPanel({
+  devices, liveInputs, channels, onRefreshDevices, onActivate, onDeactivate,
+}: LiveInputPanelProps) {
+  const [expandedCh, setExpandedCh] = useState<number | null>(null);
+  const [selectedDevice, setSelectedDevice] = useState<Record<number, string>>({});
+  const [selectedHwCh, setSelectedHwCh] = useState<Record<number, number>>({});
+
+  return (
+    <div style={{ padding: "12px", background: "#111827", color: "#fff", borderRadius: "6px", marginBottom: "16px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px", flexWrap: "wrap", gap: "8px" }}>
+        <h3 style={{ margin: 0, fontSize: "13px", fontFamily: "monospace" }}>Hardware Live Input Routing Panel</h3>
+        <button onClick={onRefreshDevices} style={{ padding: "5px 10px", background: "#3b82f6", border: "none", color: "#fff", borderRadius: "4px", cursor: "pointer", fontSize: "11px", fontWeight: "bold" }}>
+          SCAN INTERFACE
+        </button>
+      </div>
+
+      {/* Grid Responsif Otomatis menyesuaikan dari layar HP kecil s.d Monitor Desktop */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: "8px" }}>
+        {channels.map(ch => {
+          const isActive = liveInputs.get(ch.id)?.active ?? false;
+          return (
+            <div key={ch.id} style={{ background: "#1f2937", padding: "8px", borderRadius: "4px", border: isActive ? "1px solid #10b981" : "1px solid #374151", display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: "11px", fontWeight: "bold", color: ch.color }}>{ch.name}</span>
+                {isActive ? (
+                  <button onClick={() => onDeactivate(ch.id)} style={{ padding: "2px 5px", background: "#ef4444", border: "none", color: "#fff", borderRadius: "3px", fontSize: "10px", cursor: "pointer" }}>OFF</button>
+                ) : (
+                  <button onClick={() => setExpandedCh(expandedCh === ch.id ? null : ch.id)} style={{ padding: "2px 5px", background: "#10b981", border: "none", color: "#fff", borderRadius: "3px", fontSize: "10px", cursor: "pointer" }}>SETUP</button>
+                )}
+              </div>
+              {isActive && <div style={{ fontSize: "10px", color: "#10b981", marginTop: "4px" }}>🟢 HW Input {liveInputs.get(ch.id)!.inputChannel + 1}</div>}
+              
+              {expandedCh === ch.id && !isActive && (
+                <div style={{ marginTop: "6px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                  <select onChange={e => setSelectedDevice({ ...selectedDevice, [ch.id]: e.target.value })} style={{ padding: "4px", fontSize: "10px", background: "#374151", color: "#fff", border: "1px solid #4b5563", borderRadius: "3px" }}>
+                    <option value="">-- Interface --</option>
+                    {devices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label}</option>)}
+                  </select>
+                  <select onChange={e => setSelectedHwCh({ ...selectedHwCh, [ch.id]: Number(e.target.value) })} style={{ padding: "4px", fontSize: "10px", background: "#374151", color: "#fff", border: "1px solid #4b5563", borderRadius: "3px" }}>
+                    {Array.from({ length: 8 }, (_, i) => <option key={i} value={i}>Input CH {i + 1}</option>)}
+                  </select>
+                  <button onClick={() => { onActivate(ch.id, selectedDevice[ch.id] || "default", selectedHwCh[ch.id] || 0); setExpandedCh(null); }} style={{ padding: "4px", background: "#10b981", border: "none", color: "#fff", fontSize: "10px", fontWeight: "bold", cursor: "pointer", borderRadius: "3px" }}>CONNECT</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+import { useState } from "react";
+import { useAudioEngine } from "../hooks/useAudioEngine";
+import { useLiveInputs } from "../hooks/useLiveInputs";
+import { LiveInputPanel } from "./LiveInputPanel";
+
+export default function Mixer() {
+  const engine = useAudioEngine();
+  const [showLive, setShowLive] = useState(true);
+
+  const live = useLiveInputs(
+    engine.getContext(),
+    (channelId, node) => engine.connectLiveSource(channelId, node),
+    (channelId) => engine.disconnectLiveSource(channelId),
+  );
+
+  return (
+    <div style={{ padding: "12px", background: "#0b0f19", minHeight: "100vh", color: "#f3f4f6", fontFamily: "monospace", boxSizing: "border-box" }}>
+      
+      {/* HEADER UTAMA */}
+      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", flexWrap: "wrap", gap: "8px", borderBottom: "1px solid #1f2937", paddingBottom: "8px" }}>
+        <div>
+          <h2 style={{ margin: 0, color: "#00ff88", fontSize: "18px", letterSpacing: "0.05em" }}>Fr audio - Mixer Pro</h2>
+          <span style={{ fontSize: "10px", color: "#6b7280" }}>Digital Loudspeaker Management & DSP Routing System</span>
+        </div>
+        <button onClick={() => setShowLive(!showLive)} style={{ padding: "6px 12px", background: "#1f2937", border: "1px solid #374151", color: "#fff", cursor: "pointer", fontSize: "11px", borderRadius: "4px", fontWeight: "bold" }}>
+          {showLive ? "SEMBUNYIKAN PANEL ROUTING" : "TAMPILKAN PANEL ROUTING"}
+        </button>
+      </header>
+
+      {/* RENDER HARDWARE INTEGRATION ROUTING PANEL */}
+      {showLive && (
+        <LiveInputPanel
+          devices={live.devices} 
+          liveInputs={live.liveInputs} 
+          devicePermission={live.devicePermission}
+          channels={engine.channels} 
+          onRefreshDevices={live.refreshDevices}
+          onActivate={live.activateLive} 
+          onDeactivate={live.deactivateLive}
+        />
+      )}
+
+      {/* RENDER GRID MIXER CHANNELS (ANTI-TERPOTONG & RESPONSIVE BERMUTU TINGGI) */}
+      <div style={{ 
+        display: "grid", 
+        gridTemplateColumns: "repeat(auto-fill, minmax(115px, 1fr))", 
+        gap: "10px", 
+        background: "#111827", 
+        padding: "12px", 
+        borderRadius: "6px" 
+      }}>
+        {engine.channels.map(ch => (
+          <div key={ch.id} style={{ 
+            background: "#1f2937", 
+            padding: "10px 8px", 
+            borderRadius: "4px", 
+            display: "flex", 
+            flexDirection: "column", 
+            alignItems: "center", 
+            borderTop: `4px solid ${ch.color}`,
+            boxSizing: "border-box"
+          }}>
+            {/* Nama Channel Strip */}
+            <span style={{ fontSize: "12px", fontWeight: "bold", color: ch.color, marginBottom: "2px" }}>{ch.name}</span>
+            
+            {/* Lampu Led Indikator Isyarat Audio Nyata */}
+            <span style={{ fontSize: "9px", color: ch.isPlaying ? "#10b981" : "#9ca3af", fontWeight: "bold", marginBottom: "6px" }}>
+              {ch.isPlaying ? "● SIGNAL" : "STBY"}
+            </span>
+
+            {/* INTEGRASI FITUR INPUT BROWSE FILE MP3/WAV AUDIO */}
+            {ch.type === "file" && (
+              <div style={{ width: "100%", margin: "4px 0", textAlign: "center" }}>
+                <label style={{ display: "block", background: "#374151", padding: "4px 2px", fontSize: "9px", borderRadius: "3px", cursor: "pointer", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", border: "1px solid #4b5563" }}>
+                  {ch.fileName ? ch.fileName : "📁 LOAD FILE"}
+                  <input type="file" accept="audio/*" onChange={e => { if (e.target.files?.[0]) engine.loadFile(ch.id, e.target.files[0]); }} style={{ display: "none" }} />
+                </label>
+                {ch.fileName && (
+                  <div style={{ display: "flex", gap: "4px", marginTop: "4px", justifyContent: "center" }}>
+                    <button onClick={() => engine.playChannel(ch.id)} disabled={ch.isPlaying} style={{ fontSize: "8px", padding: "2px 6px", background: "#10b981", border: "none", color: "#fff", cursor: "pointer", borderRadius: "2px", fontWeight: "bold" }}>PLAY</button>
+                    <button onClick={() => engine.stopChannel(ch.id)} disabled={!ch.isPlaying} style={{ fontSize: "8px", padding: "2px 6px", background: "#ef4444", border: "none", color: "#fff", cursor: "pointer", borderRadius: "2px", fontWeight: "bold" }}>STOP</button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Potensiometer Fader Level Volume Vertikal */}
+            <div style={{ margin: "6px 0 2px 0", fontSize: "10px", color: "#9ca3af" }}>Volume</div>
+            <div style={{ height: "130px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <input 
+                type="range" min="0" max="1" step="0.01" value={ch.volume}
+                onChange={e => engine.updateChannel(ch.id, { volume: Number(e.target.value) })}
+                style={{ 
+                  writingMode: "bt-lr", 
+                  WebkitAppearance: "slider-vertical", 
+                  height: "120px", 
+                  width: "12px", 
+                  cursor: "pointer" 
+                }}
+              />
+            </div>
+            <span style={{ fontSize: "10px", marginTop: "2px", fontWeight: "bold", color: "#00ff88" }}>{Math.round(ch.volume * 100)}%</span>
+
+            {/* Tombol Sakelar Mute Bus Per Channel */}
+            <button onClick={() => engine.updateChannel(ch.id, { muted: !ch.muted })} style={{ width: "100%", marginTop: "10px", padding: "5px 0", background: ch.muted ? "#ef4444" : "#4b5563", border: "none", color: "#fff", borderRadius: "3px", fontSize: "10px", fontWeight: "bold", cursor: "pointer", transition: "background 0.1s ease" }}>
+              {ch.muted ? "MUTED" : "MUTE"}
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+  // ... (sambungan kode useAudioEngine sebelumnya)
+
+  /** Memutar seluruh channel file yang sudah terisi audio secara bersamaan */
+  const playAll = useCallback(async () => {
+    const ctx = await initAudio();
+    if (ctx.state === "suspended") await ctx.resume();
+    
+    for (const ch of channels) {
+      if (ch.type === "file" && ch.fileName && !ch.isPlaying) {
+        await playChannel(ch.id);
+      }
+    }
+  }, [initAudio, channels, playChannel]);
+
+  /** Menghentikan seluruh channel yang sedang aktif berbunyi */
+  const stopAll = useCallback(() => {
+    channels.forEach(ch => {
+      if (ch.isPlaying) {
+        if (ch.type === "file") {
+          stopChannel(ch.id);
+        } else {
+          disconnectLiveSource(ch.id);
+        }
+      }
+    });
+  }, [channels, stopChannel, disconnectLiveSource]);
+
+  // Pastikan seluruh fungsi ini diekspos di dalam return statement useAudioEngine:
+  return {
+    channels, master, isReady, reverbMix, delayMix, delayTime,
+    setReverbMix, setDelayMix, setDelayTime, loadFile, playChannel, stopChannel,
+    playAll, stopAll, updateChannel, updateMaster, connectLiveSource, 
+    disconnectLiveSource, getContext,
+  };
+} // Akhir dari fungsi useAudioEngine
+interface VUMeterProps {
+  peakL: number; peakR: number;
+  peakHoldL: number; peakHoldR: number;
+  height?: number; segments?: number; showLabels?: boolean;
+}
+
+export default function VUMeter({
+  peakL, peakR, peakHoldL, peakHoldR, height = 40, segments = 14, showLabels = true
+}: VUMeterProps) {
+  
+  const renderBars = (peak: number, hold: number) => {
+    const bars = [];
+    for (let i = 0; i < segments; i++) {
+      const threshold = (i + 1) / segments;
+      const isActive = peak >= threshold;
+      const isHold = Math.abs(hold - threshold) < (1 / segments);
+      
+      // Menentukan warna LED berdasarkan tinggi desibel suara (Hijau -> Kuning -> Merah)
+      let color = "#10b981"; // Hijau (Aman)
+      if (threshold > 0.85) color = "#ef4444"; // Merah (Clip/Bahaya)
+      else if (threshold > 0.65) color = "#f59e0b"; // Kuning (Warning)
+
+      bars.push(
+        <div key={i} style={{
+          flex: 1,
+          height: "100%",
+          background: isActive ? color : isHold ? `${color}aa` : "#1f2937",
+          borderRight: "1px solid #0b0f19",
+          transition: "background 0.05s ease"
+        }} />
+      );
+    }
+    return bars;
+  };
+
+  return (
+    <div style={{ width: "100%", background: "#0b0f19", padding: "6px", borderRadius: "4px", boxSizing: "border-box" }}>
+      {showLabels && <div style={{ display: "flex", justifyContent: "space-between", fontSize: "8px", color: "#6b7280", marginBottom: "3px" }}><span>L</span><span>MASTER LEVEL METER</span><span>R</span></div>}
+      <div style={{ display: "flex", flexDirection: "column", gap: "4px", height: `${height}px` }}>
+        <div style={{ flex: 1, display: "flex", background: "#111827", borderRadius: "2px", overflow: "hidden" }}>
+          {renderBars(peakL, peakHoldL)}
+        </div>
+        <div style={{ flex: 1, display: "flex", background: "#111827", borderRadius: "2px", overflow: "hidden" }}>
+          {renderBars(peakR, peakHoldR)}
+        </div>
+      </div>
+    </div>
+  );
+}
+interface CrossfaderProps {
+  value: number;
+  onChange: (v: number) => void;
+  width?: number | string;
+}
+
+export default function Crossfader({ value, onChange, width = "100%" }: CrossfaderProps) {
+  return (
+    <div style={{ width: width, background: "#111827", padding: "8px 12px", borderRadius: "6px", border: "1px solid #1f2937", display: "flex", flexDirection: "column", alignItems: "center" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", width: "100%", fontSize: "9px", color: "#9ca3af", marginBottom: "4px", fontWeight: "bold" }}>
+        <span>BUS A</span>
+        <span style={{ color: "#00ff88" }}>CROSSFADER ({Math.round(value * 100)})</span>
+        <span>BUS B</span>
+      </div>
+      <input
+        type="range" min="0" max="1" step="0.01" value={value}
+        onChange={e => onChange(Number(e.target.value))}
+        style={{
+          width: "100%",
+          WebkitAppearance: "none",
+          background: "#374151",
+          height: "6px",
+          borderRadius: "3px",
+          outline: "none",
+          cursor: "ew-resize"
+        }}
+      />
+    </div>
+  );
+}
+      {/* ... (sambungan di bawah penutup grid div channel milik Mixer.tsx sebelumnya) */}
+
+      {/* MASTER SECTION & GLOBAL BUS PANEL CONTROL */}
+      <footer style={{ 
+        marginTop: "12px", 
+        background: "#111827", 
+        padding: "12px", 
+        borderRadius: "6px", 
+        display: "flex", 
+        flexDirection: "row", 
+        flexWrap: "wrap", 
+        gap: "12px", 
+        alignItems: "center", 
+        justifyContent: "space-between" 
+      }}>
+        
+        {/* Tombol Kontrol Massal Global (Play All / Stop All) */}
+        <div style={{ display: "flex", gap: "6px", minWidth: "160px" }}>
+          <button onClick={() => engine.playAll()} style={{ flex: 1, padding: "8px", background: "#10b981", border: "none", color: "#fff", borderRadius: "4px", fontSize: "11px", fontWeight: "bold", cursor: "pointer" }}>
+            ▶ PLAY ALL
+          </button>
+          <button onClick={() => engine.stopAll()} style={{ flex: 1, padding: "8px", background: "#ef4444", border: "none", color: "#fff", borderRadius: "4px", fontSize: "11px", fontWeight: "bold", cursor: "pointer" }}>
+            ■ STOP ALL
+          </button>
+        </div>
+
+        {/* Bagian Render Live Crossfader */}
+        <div style={{ flex: "1 1 250px" }}>
+          <Crossfader 
+            value={engine.master.crossfade} 
+            onChange={v => engine.updateMaster({ crossfade: v })} 
+          />
+        </div>
+
+        {/* Master Output Fader Level Volume & VU Meter */}
+        <div style={{ 
+          display: "flex", 
+          alignItems: "center", 
+          gap: "12px", 
+          background: "#1f2937", 
+          padding: "8px 12px", 
+          borderRadius: "6px", 
+          minWidth: "260px",
+          flex: "1 1 auto"
+        }}>
+          <div style={{ flex: 1 }}>
+            <VUMeter 
+              peakL={engine.master.peakL} 
+              peakR={engine.master.peakR} 
+              peakHoldL={engine.master.peakHoldL} 
+              peakHoldR={engine.master.peakHoldR} 
+              height={28}
+            />
+          </div>
+          
+          {/* Fader Volume Master Utama */}
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+            <span style={{ fontSize: "9px", color: "#ef4444", fontWeight: "bold", visibility: engine.master.limiterActive ? "visible" : "hidden" }}>
+              LIMIT
+            </span>
+            <input 
+              type="range" min="0" max="1" step="0.01" value={master.volume}
+              onChange={e => engine.updateMaster({ volume: Number(e.target.value) })}
+              style={{ width: "80px", cursor: "pointer" }}
+            />
+            <span style={{ fontSize: "10px", color: "#00ff88", fontWeight: "bold", marginTop: "2px" }}>
+              MST: {Math.round(master.volume * 100)}%
+            </span>
+          </div>
+        </div>
+
+      </footer>
+    </div>
+  );
+} 
+// Akhir dari fungsi komponen Mixer utama
+  </body>
+</html
